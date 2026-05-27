@@ -1,122 +1,66 @@
 import { Link } from "react-router-dom";
+import { useAuth } from "./context/AuthContext";
 import "./Home.css";
-
-function IconPolya() {
-  return (
-    <svg className="home-feature-icon-svg" viewBox="0 0 48 48" aria-hidden>
-      <defs>
-        <linearGradient id="home-grad-a" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stopColor="#0f766e" />
-          <stop offset="100%" stopColor="#14b8a6" />
-        </linearGradient>
-      </defs>
-      <circle cx="24" cy="24" r="20" fill="none" stroke="url(#home-grad-a)" strokeWidth="1.5" opacity="0.35" />
-      <path
-        fill="none"
-        stroke="url(#home-grad-a)"
-        strokeWidth="2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        d="M16 32V16l8 8 8-8v16"
-      />
-      <circle cx="24" cy="14" r="2" fill="url(#home-grad-a)" />
-    </svg>
-  );
-}
-
-function IconGrade() {
-  return (
-    <svg className="home-feature-icon-svg" viewBox="0 0 48 48" aria-hidden>
-      <defs>
-        <linearGradient id="home-grad-b" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stopColor="#0d9488" />
-          <stop offset="100%" stopColor="#2dd4bf" />
-        </linearGradient>
-      </defs>
-      <rect x="10" y="14" width="28" height="22" rx="3" fill="none" stroke="url(#home-grad-b)" strokeWidth="1.75" />
-      <path d="M16 22h16M16 28h10" stroke="url(#home-grad-b)" strokeWidth="1.75" strokeLinecap="round" />
-      <path
-        d="M30 8l4 4-4 4"
-        fill="none"
-        stroke="url(#home-grad-b)"
-        strokeWidth="1.75"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-function IconAdaptive() {
-  return (
-    <svg className="home-feature-icon-svg" viewBox="0 0 48 48" aria-hidden>
-      <defs>
-        <linearGradient id="home-grad-c" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stopColor="#14b8a6" />
-          <stop offset="100%" stopColor="#0f766e" />
-        </linearGradient>
-      </defs>
-      <circle cx="24" cy="20" r="8" fill="none" stroke="url(#home-grad-c)" strokeWidth="1.75" />
-      <path
-        d="M14 36c4-6 20-6 24 0"
-        fill="none"
-        stroke="url(#home-grad-c)"
-        strokeWidth="1.75"
-        strokeLinecap="round"
-      />
-      <circle cx="24" cy="20" r="3" fill="url(#home-grad-c)" opacity="0.4" />
-    </svg>
-  );
-}
+import IridescenceBackground from "./components/IridescenceBackground";
 
 export default function Home() {
+  const { user, loading, setShowSignIn } = useAuth();
+
   return (
     <div className="home-page">
-      <div className="home-page-bg" aria-hidden />
+      <div className="home-page-bg" aria-hidden>
+        <IridescenceBackground color={[0.95, 1, 0.98]} speed={0.85} amplitude={0.12} />
+      </div>
 
-      <section className="home-hero">
+      <section className="home-hero" aria-labelledby="home-headline">
         <p className="home-eyebrow">AI Tutor</p>
-        <h1 className="home-headline">Equal Education for Everyone</h1>
+        <h1 id="home-headline" className="home-headline">
+          Equal Education for Everyone
+        </h1>
         <p className="home-lede">
-          Step-by-step reasoning, textbook-grounded answers, and instant feedback — in one place.
+          Ask a math question in plain language. We match your textbook, explain with structure, and remember your
+          topic checklist when you sign in.
         </p>
-        <div className="home-actions">
-          <Link to="/learning" className="home-btn home-btn--primary">
-            Learning Mode
+
+        {!loading && user && (
+          <div className="home-welcome-inline">
+            {user.photoURL ? (
+              <img src={user.photoURL} alt="" className="home-welcome-inline-avatar" referrerPolicy="no-referrer" />
+            ) : null}
+            <p className="home-welcome-inline-text">
+              Signed in as <strong>{user.isAnonymous ? "Guest" : (user.displayName || user.email)}</strong>
+            </p>
+          </div>
+        )}
+
+        <div className="home-primary-block">
+          <Link to="/learning" className="home-btn home-btn--primary home-btn--hero">
+            {user ? "Continue to Learning Mode" : "Start learning"}
           </Link>
-          <Link to="/autograder" className="home-btn home-btn--ghost">
+          {!loading && !user && (
+            <button type="button" className="home-btn home-btn--signin" onClick={() => setShowSignIn(true)}>
+              Sign in
+            </button>
+          )}
+        </div>
+
+        {!loading && !user && (
+          <p className="home-microcopy">
+            You can open Learning Mode without an account. Sign in to save chats and sync progress.
+          </p>
+        )}
+
+        <nav className="home-secondary-links" aria-label="Other tools">
+          <Link to="/autograder" className="home-secondary-link">
             Auto Grader
           </Link>
-          <Link to="/learning-bar" className="home-btn home-btn--ghost">
-            My Learning bar
+          <span className="home-secondary-sep" aria-hidden>
+            ·
+          </span>
+          <Link to="/profile" className="home-secondary-link">
+            My profile
           </Link>
-        </div>
-      </section>
-
-      <section className="home-features" aria-label="Features">
-        <article className="home-feature-card">
-          <div className="home-feature-icon-wrap">
-            <IconPolya />
-          </div>
-          <h2 className="home-feature-title">Step-by-Step Teaching</h2>
-          <p className="home-feature-desc">Interactive guidance inspired by Polya’s method — understand the problem before the proof.</p>
-        </article>
-
-        <article className="home-feature-card">
-          <div className="home-feature-icon-wrap">
-            <IconGrade />
-          </div>
-          <h2 className="home-feature-title">Auto Grading</h2>
-          <p className="home-feature-desc">Submit text or images and get structured feedback when you need it.</p>
-        </article>
-
-        <article className="home-feature-card">
-          <div className="home-feature-icon-wrap">
-            <IconAdaptive />
-          </div>
-          <h2 className="home-feature-title">Adaptive Learning</h2>
-          <p className="home-feature-desc">Responses tuned to your chapter and pace, with memory of what you’ve covered.</p>
-        </article>
+        </nav>
       </section>
     </div>
   );

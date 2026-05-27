@@ -1,36 +1,78 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useCallback, useEffect, useLayoutEffect } from "react";
+import { useLocation } from "react-router-dom";
 import "./Chat.css";
-import { API_BASE } from "./apiBase";
+import { apiUrl } from "./apiBase";
 import { useCurriculum } from "./context/CurriculumContext";
+import {
+  fetchTextbookTreeForId,
+  focsOutlineToCurriculum,
+  readSelectedTextbookId,
+  reconcileSelectedTextbookWithCatalog,
+} from "./learningTextbooks";
 import MarkdownMessage from "./MarkdownMessage";
 import { getOrCreateStudentId } from "./utils/studentId";
+import { useAuth } from "./context/AuthContext";
+import ChatHistory from "./ChatHistory";
+import LearningBarPanel, { type OutlineSectionPreviewDetail } from "./LearningBarPanel";
 
 /** Left textbook panel width as % of layout (matches state rightPanelWidth). */
 const TEXTBOOK_PANEL_MIN_PCT = 15;
 const TEXTBOOK_PANEL_MAX_PCT = 90;
 
 const WELCOME_MSG =
-  "Let’s do a quick learning diagnosis first, then start the teaching. Please answer these 3 questions in one message:\n1) Are you learning new content or reviewing for an exam?\n2) Which chapter/section have you reached so far?\n3) Which chapter(s) or section(s) do you want to study now?\n\nI will match the right topic using the textbook tree structure, then guide you step by step through tasks.";
+  "1) Are you learning new content or reviewing for an exam?\n2) On the left, in **Learning progress**: use the **dot** to mark topics learned / not learned; click a **section title** that shows page numbers to open those book pages in the textbook panel.\n3) Which chapter(s) or section(s) do you want to study now?\n\nI will match the right topic using the textbook tree structure, then guide you step by step through tasks.";
 
-/** Must match backend MAX_USER_PDF_BYTES (~14MB). */
-const MAX_PDF_UPLOAD_BYTES = 14 * 1024 * 1024;
+/** Client-side cap for chat PDF attach; keep in line with backend MAX_USER_PDF_MB (default 100). */
+const MAX_PDF_UPLOAD_BYTES = 100 * 1024 * 1024;
+
+const LEARNING_BAR_WIDTH_KEY = "ai_tutor_learning_bar_width_px";
+const LEARNING_BAR_COLLAPSED_KEY = "ai_tutor_learning_bar_collapsed";
+const LEARNING_BAR_MIN_PX = 200;
+const LEARNING_BAR_MAX_PX = 560;
+const LEARNING_BAR_DEFAULT_PX = 280;
+
+function readLearningBarWidthPx(): number {
+  try {
+    const raw = localStorage.getItem(LEARNING_BAR_WIDTH_KEY);
+    const v = raw ? parseInt(raw, 10) : NaN;
+    if (!Number.isFinite(v)) return LEARNING_BAR_DEFAULT_PX;
+    return Math.min(LEARNING_BAR_MAX_PX, Math.max(LEARNING_BAR_MIN_PX, v));
+  } catch {
+    return LEARNING_BAR_DEFAULT_PX;
+  }
+}
+
+function readLearningBarCollapsed(): boolean {
+  try {
+    return localStorage.getItem(LEARNING_BAR_COLLAPSED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 
 export default function LearningModel() {
+  const location = useLocation();
   const [studentId] = useState<string>(() => getOrCreateStudentId());
+  const { user, token } = useAuth();
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<any[]>([{ sender: "ai", text: WELCOME_MSG }]);
-  const { curriculumTree } = useCurriculum();
+  const { curriculumTree, setCurriculumTree } = useCurriculum();
+  const [textbookId, setTextbookId] = useState(() => readSelectedTextbookId());
 
   const [matchedSection, setMatchedSection] = useState<any>(null);
   const [dataMatchedTopic, setDataMatchedTopic] = useState<{
     name: string;
-    start: number;
-    end: number;
+    startBook: number;
+    endBook: number;
   } | null>(null);
   const [referencePageImage, setReferencePageImage] = useState<string | null>(null);
   const [referencePageSnippets, setReferencePageSnippets] = useState<string[] | null>(null);
   const [referenceSectionPages, setReferenceSectionPages] = useState<string[] | null>(null);
   const [sectionPageIndex, setSectionPageIndex] = useState(0);
+  const [outlinePreviewLoading, setOutlinePreviewLoading] = useState(false);
+  const [outlinePreviewError, setOutlinePreviewError] = useState<string | null>(null);
   const [enlargedImageSrc, setEnlargedImageSrc] = useState<string | null>(null);
   const [attachedImages, setAttachedImages] = useState<string[]>([]);
   const [pdfAttachment, setPdfAttachment] = useState<{ name: string; dataUrl: string } | null>(null);
@@ -41,9 +83,238 @@ export default function LearningModel() {
   const layoutRef = useRef<HTMLDivElement>(null);
   const resizeStartRef = useRef<{ x: number; width: number } | null>(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const tree = await fetchTextbookTreeForId(token, textbookId);
+      if (cancelled) return;
+      setCurriculumTree(focsOutlineToCurriculum(tree));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [textbookId, token, setCurriculumTree]);
+
+  useLayoutEffect(() => {
+    reconcileSelectedTextbookWithCatalog();
+    setTextbookId(readSelectedTextbookId());
+  }, []);
+
+  useEffect(() => {
+    reconcileSelectedTextbookWithCatalog();
+    setTextbookId(readSelectedTextbookId());
+  }, [location.pathname]);
+
+  useEffect(() => {
+    const sync = () => {
+      reconcileSelectedTextbookWithCatalog();
+      setTextbookId(readSelectedTextbookId());
+    };
+    window.addEventListener("ai-tutor-textbook-changed", sync);
+    window.addEventListener("storage", sync);
+    return () => {
+      window.removeEventListener("ai-tutor-textbook-changed", sync);
+      window.removeEventListener("storage", sync);
+    };
+  }, []);
+
+  const handleOutlineSectionPreview = useCallback(
+    async (detail: OutlineSectionPreviewDetail) => {
+      setOutlinePreviewError(null);
+      setLeftPanelOpen(true);
+      setDataMatchedTopic(null);
+      setMatchedSection(null);
+      setReferencePageImage(null);
+      setReferencePageSnippets(null);
+      setReferenceSectionPages(null);
+      setSectionPageIndex(0);
+      setOutlinePreviewLoading(true);
+      if (textbookId.startsWith("user_") && !token) {
+        setOutlinePreviewLoading(false);
+        setOutlinePreviewError("Sign in to view pages for your uploaded textbook.");
+        return;
+      }
+      const parseJson = async (r: Response) => {
+        try {
+          return (await r.json()) as Record<string, unknown>;
+        } catch {
+          return {} as Record<string, unknown>;
+        }
+      };
+      try {
+        const qs = new URLSearchParams({
+          textbook_id: textbookId,
+          start_book: String(detail.startBook),
+          end_book: String(detail.endBook),
+          section_title: detail.sectionTitle,
+        });
+        const headers: Record<string, string> = {};
+        if (token) headers.Authorization = `Bearer ${token}`;
+        const resp = await fetch(apiUrl(`/api/textbook_pages?${qs}`), { headers });
+        const data = (await parseJson(resp)) as {
+          detail?: string;
+          pages_b64?: string[];
+          matched_topic?: {
+            name: string;
+            start_book?: number;
+            end_book?: number;
+            start?: number;
+            end?: number;
+          };
+        };
+
+        if (resp.ok) {
+          const b64 = Array.isArray(data?.pages_b64) ? data.pages_b64 : [];
+          if (b64.length) {
+            setReferenceSectionPages(b64.map((x) => `data:image/png;base64,${x}`));
+            if (data.matched_topic) {
+              const sb = data.matched_topic.start_book ?? data.matched_topic.start ?? detail.startBook;
+              const eb = data.matched_topic.end_book ?? data.matched_topic.end ?? detail.endBook;
+              setDataMatchedTopic({
+                name: data.matched_topic.name,
+                startBook: sb,
+                endBook: eb,
+              });
+            }
+          } else {
+            setReferenceSectionPages(null);
+            setDataMatchedTopic(null);
+            setOutlinePreviewError(
+              "No PDF pages were rendered (missing PDF on the server or invalid page range)."
+            );
+          }
+        } else if (resp.status === 404 && detail.sectionHint.trim()) {
+          const hint = detail.sectionHint.trim();
+          const chHeaders: Record<string, string> = { "Content-Type": "application/json" };
+          if (token) chHeaders.Authorization = `Bearer ${token}`;
+          const cResp = await fetch(apiUrl("/api/chat"), {
+            method: "POST",
+            headers: chHeaders,
+            body: JSON.stringify({
+              message: hint,
+              history: [],
+              student_id: studentId,
+              session_id: null,
+              textbook_id: textbookId,
+              silent: true,
+            }),
+          });
+          const cData = (await parseJson(cResp)) as {
+            detail?: string;
+            reference_section_pages_b64?: string[];
+            matched_topic?: {
+              name: string;
+              start_book?: number;
+              end_book?: number;
+              start?: number;
+              end?: number;
+            };
+          };
+          if (!cResp.ok) {
+            setOutlinePreviewError(
+              typeof cData?.detail === "string" ? cData.detail : "Could not load book pages."
+            );
+            return;
+          }
+          const cb64 = cData.reference_section_pages_b64;
+          if (Array.isArray(cb64) && cb64.length) {
+            setReferenceSectionPages(cb64.map((x) => `data:image/png;base64,${x}`));
+            setSectionPageIndex(0);
+            setReferencePageSnippets(null);
+            setReferencePageImage(null);
+            if (cData.matched_topic) {
+              const sb = cData.matched_topic.start_book ?? cData.matched_topic.start ?? detail.startBook;
+              const eb = cData.matched_topic.end_book ?? cData.matched_topic.end ?? detail.endBook;
+              setDataMatchedTopic({
+                name: cData.matched_topic.name,
+                startBook: sb,
+                endBook: eb,
+              });
+            }
+            setOutlinePreviewError(null);
+          } else {
+            setReferenceSectionPages(null);
+            setDataMatchedTopic(null);
+            setOutlinePreviewError(
+              "Could not load pages for this section. Try asking in chat with the section number (e.g. 8.1), or deploy the latest API (includes /api/textbook_pages)."
+            );
+          }
+        } else {
+          setOutlinePreviewError(
+            typeof data?.detail === "string" ? data.detail : "Could not load book pages."
+          );
+        }
+      } catch {
+        setOutlinePreviewError("Could not reach the server while loading pages.");
+      } finally {
+        setOutlinePreviewLoading(false);
+      }
+    },
+    [textbookId, token, studentId]
+  );
+
+  const [learningBarCollapsed, setLearningBarCollapsed] = useState(readLearningBarCollapsed);
+  const [learningBarWidthPx, setLearningBarWidthPx] = useState(readLearningBarWidthPx);
+  const learningBarDragRef = useRef<{ x: number; width: number } | null>(null);
+  const learningBarWidthRef = useRef(learningBarWidthPx);
+  learningBarWidthRef.current = learningBarWidthPx;
+
+  const persistLearningBarCollapsed = useCallback((collapsed: boolean) => {
+    setLearningBarCollapsed(collapsed);
+    try {
+      if (collapsed) localStorage.setItem(LEARNING_BAR_COLLAPSED_KEY, "1");
+      else localStorage.removeItem(LEARNING_BAR_COLLAPSED_KEY);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const handleLearningBarResizeMove = useCallback((e: MouseEvent) => {
+    const start = learningBarDragRef.current;
+    if (!start) return;
+    const dx = e.clientX - start.x;
+    const next = Math.min(
+      LEARNING_BAR_MAX_PX,
+      Math.max(LEARNING_BAR_MIN_PX, start.width + dx)
+    );
+    learningBarWidthRef.current = next;
+    setLearningBarWidthPx(next);
+  }, []);
+
+  const handleLearningBarResizeEnd = useCallback(() => {
+    learningBarDragRef.current = null;
+    window.removeEventListener("mousemove", handleLearningBarResizeMove);
+    window.removeEventListener("mouseup", handleLearningBarResizeEnd);
+    try {
+      localStorage.setItem(LEARNING_BAR_WIDTH_KEY, String(learningBarWidthRef.current));
+    } catch {
+      /* ignore */
+    }
+  }, [handleLearningBarResizeMove]);
+
+  const handleLearningBarResizeStart = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      learningBarDragRef.current = { x: e.clientX, width: learningBarWidthRef.current };
+      window.addEventListener("mousemove", handleLearningBarResizeMove);
+      window.addEventListener("mouseup", handleLearningBarResizeEnd);
+    },
+    [handleLearningBarResizeMove, handleLearningBarResizeEnd]
+  );
+
+  useEffect(() => {
+    return () => {
+      learningBarDragRef.current = null;
+      window.removeEventListener("mousemove", handleLearningBarResizeMove);
+      window.removeEventListener("mouseup", handleLearningBarResizeEnd);
+    };
+  }, [handleLearningBarResizeMove, handleLearningBarResizeEnd]);
+
   const hasLeftPanelContent = Boolean(
     dataMatchedTopic ||
       matchedSection ||
+      outlinePreviewLoading ||
+      Boolean(outlinePreviewError) ||
       (referenceSectionPages && referenceSectionPages.length > 0) ||
       (referencePageSnippets && referencePageSnippets.length > 0) ||
       referencePageImage
@@ -183,6 +454,7 @@ export default function LearningModel() {
     const hasPdf = Boolean(pdfSnapshot);
     if (!userText && !hasImages && !hasPdf) return;
     if (isAwaitingReply) return;
+    setOutlinePreviewError(null);
 
     const displayMessage =
       userText ||
@@ -210,6 +482,7 @@ export default function LearningModel() {
           reference_page_image_b64?: string;
           reference_page_snippets_b64?: string[];
           reference_section_pages_b64?: string[];
+          session_id?: string;
         }
       | undefined;
     const CHAT_TIMEOUT_MS = 120000;
@@ -217,15 +490,23 @@ export default function LearningModel() {
     let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => controller.abort(), CHAT_TIMEOUT_MS);
 
     try {
-      const resp = await fetch(`${API_BASE}/api/chat`, {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+      const resp = await fetch(apiUrl("/api/chat"), {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
           message: displayMessage,
           history: messages,
           images_b64: imagesB64,
           pdf_b64: hasPdf ? pdfSnapshot!.dataUrl : undefined,
           student_id: studentId,
+          session_id: sessionId,
+          textbook_id: textbookId,
         }),
         signal: controller.signal,
       });
@@ -233,6 +514,11 @@ export default function LearningModel() {
       timeoutId = null;
 
       data = await resp.json();
+      // Track session ID for subsequent messages
+      if (data?.session_id && !sessionId) {
+        setSessionId(data.session_id);
+        setRefreshTrigger((n) => n + 1);
+      }
       if (!resp.ok) {
         const detail = (data as any)?.detail || (data as any)?.error || "Backend request failed.";
         addAIMessage(`Backend error: ${detail}`);
@@ -244,10 +530,12 @@ export default function LearningModel() {
       const conf = typeof data.confidence === "number" ? data.confidence : null;
 
       if (data.matched_topic) {
+        const sb = data.matched_topic.start_book ?? data.matched_topic.startBook ?? data.matched_topic.start;
+        const eb = data.matched_topic.end_book ?? data.matched_topic.endBook ?? data.matched_topic.end;
         setDataMatchedTopic({
           name: data.matched_topic.name,
-          start: data.matched_topic.start,
-          end: data.matched_topic.end,
+          startBook: sb,
+          endBook: eb,
         });
       } else {
         setDataMatchedTopic(null);
@@ -341,6 +629,7 @@ export default function LearningModel() {
 
   const reset = () => {
     setMessages([{ sender: "ai", text: WELCOME_MSG }]);
+    setSessionId(null);
     setMatchedSection(null);
     setDataMatchedTopic(null);
     setReferencePageImage(null);
@@ -350,10 +639,101 @@ export default function LearningModel() {
     setEnlargedImageSrc(null);
     setPdfAttachment(null);
     setIsAwaitingReply(false);
+    setOutlinePreviewLoading(false);
+    setOutlinePreviewError(null);
+  };
+
+  const loadSession = async (sid: string) => {
+    if (!token) return;
+    try {
+      const resp = await fetch(apiUrl(`/api/sessions/${sid}`), {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const msgs = (data.messages || []).map((m: any) => ({
+        sender: m.sender,
+        text: m.text,
+      }));
+      setMessages(msgs.length > 0 ? msgs : [{ sender: "ai", text: WELCOME_MSG }]);
+      setSessionId(sid);
+      setMatchedSection(null);
+      setDataMatchedTopic(null);
+      setReferencePageImage(null);
+      setReferencePageSnippets(null);
+      setReferenceSectionPages(null);
+      setSectionPageIndex(0);
+      setOutlinePreviewLoading(false);
+      setOutlinePreviewError(null);
+    } catch (e) {
+      console.error("Failed to load session", e);
+    }
+  };
+
+  const handleNewChat = () => {
+    reset();
+    setRefreshTrigger((n) => n + 1);
   };
 
   return (
     <div className="learning-page-wrapper">
+      {learningBarCollapsed ? (
+        <div className="learning-bar-root learning-bar-root--collapsed">
+          <button
+            type="button"
+            className="learning-bar-reveal-btn"
+            onClick={() => persistLearningBarCollapsed(false)}
+            title="Show learning progress"
+            aria-label="Show learning progress"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+          </button>
+        </div>
+      ) : (
+        <div
+          className="learning-bar-column"
+          style={{ width: learningBarWidthPx, flexShrink: 0 }}
+        >
+          <div className="learning-bar-column-body">
+            <LearningBarPanel
+              variant="embed"
+              studentId={studentId}
+              onOutlineSectionPreview={handleOutlineSectionPreview}
+              embedHeaderEnd={
+                <button
+                  type="button"
+                  className="learning-bar-hide-btn"
+                  onClick={() => persistLearningBarCollapsed(true)}
+                  title="Hide learning progress"
+                  aria-label="Hide learning progress"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    <polyline points="15 18 9 12 15 6" />
+                  </svg>
+                </button>
+              }
+            />
+            <div
+              className="resize-handle learning-bar-resize-handle"
+              onMouseDown={handleLearningBarResizeStart}
+              title="Drag right to widen, left to narrow"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize learning progress panel"
+            />
+          </div>
+        </div>
+      )}
+      {user && (
+        <ChatHistory
+          activeSessionId={sessionId}
+          onSelectSession={loadSession}
+          onNewChat={handleNewChat}
+          refreshTrigger={refreshTrigger}
+        />
+      )}
     <div className="learning-layout" ref={layoutRef}>
       {/* LEFT: textbook / reference (when content exists; can collapse) */}
       {showLeftColumn && (
@@ -369,13 +749,13 @@ export default function LearningModel() {
               aria-label="Current textbook section"
             >
               <span className="left-panel-topic-bar-title">
-                📖 Textbook: {dataMatchedTopic.name}
+                Textbook: {dataMatchedTopic.name}
               </span>
               <span className="left-panel-topic-bar-sep" aria-hidden="true">
                 ·
               </span>
               <span className="left-panel-topic-bar-pages">
-                Pages {dataMatchedTopic.start}–{dataMatchedTopic.end}
+                Pages {dataMatchedTopic.startBook}–{dataMatchedTopic.endBook}
               </span>
             </div>
             <button
@@ -400,16 +780,16 @@ export default function LearningModel() {
           </div>
         )}
 
-        {matchedSection ? (
-          <div className="match-box">
-            <h4>🔍 Topic: {matchedSection.topic}</h4>
-            <h5>📘 Chapter: {matchedSection.chapter}</h5>
-            <ul>
-              {matchedSection.key_points.map((kp: string, i: number) => (
-                <li key={i}>• {kp}</li>
-              ))}
-            </ul>
+        {outlinePreviewLoading ? (
+          <div className="outline-preview-status" role="status" aria-live="polite">
+            <span className="learning-reply-status-spinner" aria-hidden />
+            <span>Loading book pages…</span>
           </div>
+        ) : null}
+        {outlinePreviewError ? (
+          <p className="outline-preview-error" role="alert">
+            {outlinePreviewError}
+          </p>
         ) : null}
 
         {(referenceSectionPages?.length || referencePageSnippets?.length || referencePageImage) && (
